@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Distribution / packaging
+build/
+dist/
+*.spec
+*.egg-info/
+
+# Reports and local scan outputs
+reports/*
+!reports/.gitkeep
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local agent/tool state
+.agents/
+.codex/
+
+# Temporary files
+*.tmp
+*.bak
