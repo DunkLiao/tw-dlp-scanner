@@ -25,6 +25,7 @@ DLP Scanner - 敏感資料掃描工具
 import os
 import re
 import sys
+import tempfile
 import zipfile
 import threading
 import queue
@@ -56,15 +57,29 @@ try:
 except ImportError:
     pdfplumber = None
 
+try:
+    import xlrd
+except ImportError:
+    xlrd = None
+
+try:
+    import olefile
+except ImportError:
+    olefile = None
+
 APP_NAME = "DLP 敏感資料掃描工具"
 APP_VERSION = "1.0.0"
 
 SUPPORTED_TEXT_EXTS = {
     ".txt", ".csv", ".log", ".md", ".json", ".xml", ".html", ".htm"
 }
-SUPPORTED_DOC_EXTS = {".docx", ".xlsx", ".pdf"}
+SUPPORTED_DOC_EXTS = {".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pdf"}
 SUPPORTED_SCAN_EXTS = SUPPORTED_TEXT_EXTS | SUPPORTED_DOC_EXTS
 ENCRYPT_TARGET_EXTS = {".docx", ".xlsx", ".pptx", ".pdf", ".zip", ".rar", ".7z"}
+ENCRYPTED_FILE_RULE = "2. 加密檔案"
+MAX_ZIP_SCAN_DEPTH = 5
+MAX_ZIP_ENTRY_BYTES = 50 * 1024 * 1024
+MAX_ZIP_TOTAL_BYTES = 500 * 1024 * 1024
 
 RISK_LEVELS = {
     "1. 組合式個資": "高",
@@ -253,6 +268,81 @@ def read_docx(path):
         return ""
 
 
+def read_ole_text_from_bytes(data):
+    text_parts = []
+
+    for encoding in ("utf-16le", "utf-16be"):
+        decoded = data.decode(encoding, errors="ignore")
+        cleaned = "".join(char if (char.isprintable() or char in "\r\n\t") else "\n" for char in decoded)
+        text_parts.extend(part.strip() for part in re.split(r"\s*\n+\s*", cleaned) if len(part.strip()) >= 4)
+
+    for match in re.finditer(rb"[\x09\x0a\x0d\x20-\x7e]{4,}", data):
+        text_parts.append(match.group().decode("latin-1", errors="ignore").strip())
+
+    seen = set()
+    unique_parts = []
+    for part in text_parts:
+        if part and part not in seen:
+            seen.add(part)
+            unique_parts.append(part)
+    return "\n".join(unique_parts)
+
+
+def read_ole_text(path):
+    file_path = Path(path)
+    parts = []
+
+    if olefile is not None:
+        try:
+            if olefile.isOleFile(str(file_path)):
+                with olefile.OleFileIO(str(file_path)) as ole:
+                    for stream_name in ole.listdir(streams=True, storages=False):
+                        try:
+                            with ole.openstream(stream_name) as stream:
+                                parts.append(read_ole_text_from_bytes(stream.read()))
+                        except Exception:
+                            continue
+        except Exception:
+            parts = []
+
+    if not parts:
+        try:
+            parts.append(read_ole_text_from_bytes(file_path.read_bytes()))
+        except Exception:
+            return ""
+
+    return "\n".join(part for part in parts if part)
+
+
+def read_doc(path):
+    return read_ole_text(path)
+
+
+def read_ppt(path):
+    return read_ole_text(path)
+
+
+def read_xls(path):
+    if xlrd is None:
+        return ""
+    try:
+        workbook = xlrd.open_workbook(str(path), on_demand=True)
+        rows = []
+        try:
+            for sheet in workbook.sheets():
+                rows.append(f"[Sheet {sheet.name}]")
+                for row_index in range(sheet.nrows):
+                    values = sheet.row_values(row_index)
+                    rows.append(" ".join("" if value is None else str(value) for value in values))
+        finally:
+            release = getattr(workbook, "release_resources", None)
+            if release is not None:
+                release()
+        return "\n".join(rows)
+    except Exception:
+        return ""
+
+
 def read_xlsx(path):
     if load_workbook is None:
         return ""
@@ -324,10 +414,16 @@ def extract_text(path):
     ext = path.suffix.lower()
     if ext in SUPPORTED_TEXT_EXTS:
         return read_text_file(path)
+    if ext == ".doc":
+        return read_doc(path)
     if ext == ".docx":
         return read_docx(path)
+    if ext == ".xls":
+        return read_xls(path)
     if ext == ".xlsx":
         return read_xlsx(path)
+    if ext == ".ppt":
+        return read_ppt(path)
     if ext == ".pdf":
         return read_pdf(path)
     return ""
@@ -362,7 +458,7 @@ def scan_file(path):
     try:
         ext = path.suffix.lower()
         if ext in ENCRYPT_TARGET_EXTS and is_encrypted_file(path):
-            hits["2. 加密檔案"] = [f"{ext} 可能為加密檔案"]
+            hits[ENCRYPTED_FILE_RULE] = [f"{ext} 可能為加密檔案"]
 
         if ext in SUPPORTED_SCAN_EXTS:
             text = extract_text(path)
@@ -371,6 +467,92 @@ def scan_file(path):
         return hits, ""
     except Exception as err:
         return hits, str(err)
+
+
+def build_result_rows(file_name, full_path, hits):
+    rows = []
+    for hit_type, samples in hits.items():
+        rows.append({
+            "risk": RISK_LEVELS.get(hit_type, "未知"),
+            "file_name": file_name,
+            "hit_type": hit_type,
+            "hit_count": len(samples),
+            "sample": " / ".join(samples[:5]),
+            "full_path": full_path,
+        })
+    return rows
+
+
+def safe_zip_member_name(name):
+    cleaned = name.replace("\\", "/").strip("/")
+    parts = [part for part in cleaned.split("/") if part and part not in {".", ".."}]
+    if not parts:
+        return "zip-entry"
+    return "/".join(parts)
+
+
+def scan_zip_archive(path, display_path=None, depth=0):
+    archive_path = Path(path)
+    archive_display_path = display_path or str(archive_path)
+    rows = []
+    total_uncompressed = 0
+
+    if depth >= MAX_ZIP_SCAN_DEPTH:
+        return rows
+
+    try:
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+
+                inner_name = safe_zip_member_name(info.filename)
+                inner_display_path = f"{archive_display_path}::{inner_name}"
+                inner_file_name = Path(inner_name).name
+
+                if info.flag_bits & 0x1:
+                    hits = {ENCRYPTED_FILE_RULE: ["zip entry encrypted"]}
+                    rows.extend(build_result_rows(inner_file_name, inner_display_path, hits))
+                    continue
+
+                if info.file_size > MAX_ZIP_ENTRY_BYTES:
+                    continue
+
+                total_uncompressed += info.file_size
+                if total_uncompressed > MAX_ZIP_TOTAL_BYTES:
+                    break
+
+                ext = Path(inner_name).suffix.lower()
+                if ext not in SUPPORTED_SCAN_EXTS and ext != ".zip" and ext not in ENCRYPT_TARGET_EXTS:
+                    continue
+
+                try:
+                    data = zf.read(info)
+                except Exception:
+                    continue
+
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_path = Path(temp_dir) / inner_file_name
+                    temp_path.write_bytes(data)
+
+                    if ext == ".zip":
+                        rows.extend(scan_zip_archive(temp_path, inner_display_path, depth + 1))
+                    else:
+                        hits, _error = scan_file(temp_path)
+                        rows.extend(build_result_rows(inner_file_name, inner_display_path, hits))
+    except Exception:
+        return rows
+
+    return rows
+
+
+def scan_path(path):
+    path = Path(path)
+    if path.suffix.lower() == ".zip":
+        return scan_zip_archive(path)
+
+    hits, _error = scan_file(path)
+    return build_result_rows(path.name, str(path), hits)
 
 
 def open_file_with_default_app(path):
@@ -470,7 +652,7 @@ class DLPScannerApp(ttk.Frame):
 
         bottom_frame = ttk.Frame(self)
         bottom_frame.pack(fill="x", pady=(8, 0))
-        ttk.Label(bottom_frame, text="支援格式：txt, csv, log, md, json, xml, html, docx, xlsx, pdf。").pack(side="left")
+        ttk.Label(bottom_frame, text="支援格式：txt, csv, log, md, json, xml, html, doc, docx, xls, xlsx, ppt, pdf, zip。").pack(side="left")
 
     def pick_folder(self):
         folder = filedialog.askdirectory(title="選擇要掃描的資料夾")
@@ -517,22 +699,14 @@ class DLPScannerApp(ttk.Frame):
         total_hit_rules = 0
 
         for index, file_path in enumerate(files, start=1):
-            hits, _error = scan_file(file_path)
-            if hits:
-                hit_file_set.add(str(file_path))
-                for hit_type, samples in hits.items():
-                    risk = RISK_LEVELS.get(hit_type, "未分類")
-                    sample_text = " / ".join(samples[:5])
+            result_rows = scan_path(file_path)
+            if result_rows:
+                hit_file_set.update(row["full_path"] for row in result_rows)
+                for row in result_rows:
                     total_hit_rules += 1
-                    self.message_queue.put({
-                        "type": "row",
-                        "risk": risk,
-                        "file_name": file_path.name,
-                        "hit_type": hit_type,
-                        "hit_count": len(samples),
-                        "sample": sample_text,
-                        "full_path": str(file_path),
-                    })
+                    message = {"type": "row"}
+                    message.update(row)
+                    self.message_queue.put(message)
 
             self.message_queue.put({"type": "progress", "current": index, "total": total_files, "file_name": file_path.name})
 

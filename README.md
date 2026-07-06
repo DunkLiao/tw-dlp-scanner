@@ -13,6 +13,7 @@ DLP 敏感資料掃描工具是一個使用 Python `tkinter` 與 `ttk` 製作的
 - 可選擇是否包含子資料夾
 - 掃描過程使用背景執行緒，避免 GUI 卡住
 - 支援掃描多種常見檔案格式
+- 支援掃描 ZIP 內部檔案與巢狀 ZIP
 - 支援信用卡號 Luhn 檢核
 - 支援加密檔案偵測
 - 掃描結果可直接匯出 Excel 報表
@@ -45,12 +46,14 @@ dlp_scanner/
 | 類型 | 副檔名 |
 |---|---|
 | 純文字 | `.txt`, `.csv`, `.log`, `.md`, `.json`, `.xml`, `.html`, `.htm` |
-| Word | `.docx` |
-| Excel | `.xlsx` |
+| Word | `.doc`, `.docx` |
+| Excel | `.xls`, `.xlsx` |
+| PowerPoint | `.ppt` |
 | PDF | `.pdf` |
+| ZIP 內部掃描 | `.zip`，支援遞迴掃描 ZIP 內的文字、Office、PDF 與巢狀 ZIP |
 | 加密檔案偵測 | `.docx`, `.xlsx`, `.pptx`, `.pdf`, `.zip`, `.rar`, `.7z` |
 
-> 注意：`.doc`, `.xls`, `.ppt`, `.msg`, `.eml`, `.rar`, `.7z` 若需要深度解析，需額外擴充套件或轉檔流程。
+> 注意：`.doc` 與 `.ppt` 採 OLE 文字最佳努力抽取；若內容是圖片、特殊二進位結構或複雜版面，可能無法完整擷取。`.rar`, `.7z`, `.msg`, `.eml` 尚未做內文解析。
 
 ---
 
@@ -122,6 +125,8 @@ pip install -r requirements.txt
 python-docx
 openpyxl
 pdfplumber
+xlrd
+olefile
 pyinstaller
 ```
 
@@ -277,13 +282,13 @@ git push -u origin main
 
 ## 已知限制
 
-1. `.doc` 與 `.xls` 不是原生支援格式
+1. `.doc` 與 `.ppt` 使用 OLE 文字最佳努力抽取，準確率低於先轉成 `.docx/.pptx` 後掃描
 2. 掃描 PDF 時，若 PDF 是圖片型掃描檔，可能無法擷取文字
 3. 中文姓名偵測依賴稱謂或職稱，可能漏判
 4. 地址格式變化很多，可能會有誤判或漏判
 5. 護照號碼目前以 9 碼數字判斷，可能與其他流水號混淆
 6. RAR 與 7Z 尚未做壓縮檔內文解析
-7. ZIP 目前只偵測是否加密，尚未遞迴掃描 ZIP 內部檔案
+7. ZIP 內部掃描有深度與大小限制，避免大型或惡意壓縮檔造成掃描卡住
 8. OCR 文字辨識尚未支援
 
 ---
@@ -291,9 +296,8 @@ git push -u origin main
 ## 建議後續擴充
 
 - 白名單排除
-- 掃描 ZIP 內部檔案
-- 支援 `.doc`、`.xls`、`.ppt`
 - 支援 `.msg`、`.eml` 郵件檔
+- 使用 LibreOffice 或 Tika 提升舊版 Office 解析準確率
 - OCR 掃描圖片型 PDF
 - 匯出 CSV 報表
 - 自訂敏感字規則
