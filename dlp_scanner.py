@@ -98,11 +98,36 @@ POLICY_THRESHOLDS = {
     "11. 居留證號碼": {"中": 1, "高": 2},
 }
 
+RISK_SORT_ORDER = {
+    "高": 0,
+    "中": 1,
+    "低": 2,
+    "提示": 3,
+}
+
 TAIWAN_CITY_COUNTY = (
     "台北市|臺北市|新北市|桃園市|台中市|臺中市|台南市|臺南市|高雄市|"
     "基隆市|新竹市|嘉義市|新竹縣|苗栗縣|彰化縣|南投縣|雲林縣|"
     "嘉義縣|屏東縣|宜蘭縣|花蓮縣|台東縣|臺東縣|澎湖縣|金門縣|連江縣"
 )
+
+CHINESE_NAME_PATTERN = re.compile(
+    r"(?<![\u4e00-\u9fff])"
+    r"(?P<name>[\u4e00-\u9fff]{2,4})"
+    r"(?P<context>先生|小姐|女士|經理|副理|襄理|課長|科長|處長|主任|同仁|客戶|君|收|敬啟)"
+)
+
+COMMON_CHINESE_SURNAMES = set(
+    "王李張劉陳楊黃趙吳周徐孫馬朱胡郭何林高梁鄭羅宋謝唐韓曹許鄧蕭馮曾程蔡彭潘袁於董余蘇葉呂魏蔣田杜丁沈姜范江傅鍾盧汪戴崔任陸廖姚方金邱夏譚韋賈鄒石熊孟秦閻薛侯雷白龍段郝孔邵史毛常萬顧賴武康賀嚴尹錢施牛洪龔"
+)
+COMPOUND_CHINESE_SURNAMES = {
+    "歐陽", "司馬", "諸葛", "上官", "司徒", "夏侯", "東方", "皇甫", "尉遲", "公孫",
+}
+CHINESE_NAME_EXCLUDE_TERMS = {
+    "貸後", "監測", "作業", "規程", "企業", "集團", "關係", "判定", "手冊", "股權",
+    "經營", "流程", "一般", "資料", "掃描", "報表", "文件", "客戶", "銀行", "帳號",
+    "信用", "公文", "密等", "關鍵", "提示", "匯出",
+}
 
 SINGLE_PATTERNS = {
     "3. 台灣地址": re.compile(
@@ -110,11 +135,6 @@ SINGLE_PATTERNS = {
         r"[\u4e00-\u9fffA-Za-z0-9]{0,30}"
         r"(路|街|大道|巷|弄|段)"
         r"[\u4e00-\u9fffA-Za-z0-9\-之號樓室F\s]{0,30}"
-    ),
-    "4. 中文姓名": re.compile(
-        r"(?<![\u4e00-\u9fff])"
-        r"[\u4e00-\u9fff]{2,4}"
-        r"(?=(先生|小姐|女士|經理|副理|襄理|課長|科長|處長|主任|同仁|客戶|君|收|敬啟))"
     ),
     "5. 台灣身分證字號": re.compile(r"\b[A-Z][12]\d{8}\b"),
     "6. 護照號碼": re.compile(r"\b\d{9}\b"),
@@ -229,6 +249,55 @@ def collect_pattern_hits(pattern, text):
     }
 
 
+def has_common_chinese_surname(name):
+    return name[:2] in COMPOUND_CHINESE_SURNAMES or name[:1] in COMMON_CHINESE_SURNAMES
+
+
+def is_likely_chinese_person_name(name):
+    if not 2 <= len(name) <= 4:
+        return False
+    if any(term in name for term in CHINESE_NAME_EXCLUDE_TERMS):
+        return False
+    return has_common_chinese_surname(name)
+
+
+def collect_chinese_name_hits(text):
+    matches = []
+    for match in CHINESE_NAME_PATTERN.finditer(text):
+        candidate = match.group("name")
+        if is_likely_chinese_person_name(candidate):
+            matches.append(candidate)
+
+    return {
+        "count": len(matches),
+        "samples": matches[:5],
+    }
+
+
+def sort_result_rows(rows):
+    return sorted(
+        rows,
+        key=lambda row: (
+            RISK_SORT_ORDER.get(row.get("risk"), len(RISK_SORT_ORDER)),
+            row.get("file_name", ""),
+            row.get("hit_type", ""),
+            row.get("full_path", ""),
+        ),
+    )
+
+
+def sort_export_rows(rows):
+    return sorted(
+        rows,
+        key=lambda row: (
+            RISK_SORT_ORDER.get(row.get("風險等級"), len(RISK_SORT_ORDER)),
+            row.get("檔案名稱", ""),
+            row.get("命中類型", ""),
+            row.get("完整路徑", ""),
+        ),
+    )
+
+
 def collect_text_detections(text):
     detected = {}
 
@@ -236,6 +305,10 @@ def collect_text_detections(text):
         hit = collect_pattern_hits(pattern, text)
         if hit["count"]:
             detected[name] = hit
+
+    name_hit = collect_chinese_name_hits(text)
+    if name_hit["count"]:
+        detected["4. 中文姓名"] = name_hit
 
     cards = find_credit_cards(text)
     if cards:
@@ -866,6 +939,7 @@ class DLPScannerApp(ttk.Frame):
         self.tree.tag_configure("高", background="#ffd6d6")
         self.tree.tag_configure("中", background="#fff2cc")
         self.tree.tag_configure("低", background="#e2f0d9")
+        self.tree.tag_configure("提示", background="#eeeeee")
         self.tree.tag_configure("未分類", background="#eeeeee")
 
         bottom_frame = ttk.Frame(self)
@@ -916,6 +990,7 @@ class DLPScannerApp(ttk.Frame):
         hit_file_set = set()
         total_hit_rules = 0
         or_hit_names = []
+        all_result_rows = []
 
         for index, file_path in enumerate(files, start=1):
             result_rows, file_or_hits = scan_path_with_or_hits(file_path)
@@ -924,13 +999,15 @@ class DLPScannerApp(ttk.Frame):
                     or_hit_names.append(hit_name)
             if result_rows:
                 hit_file_set.update(row["full_path"] for row in result_rows)
-                for row in result_rows:
-                    total_hit_rules += 1
-                    message = {"type": "row"}
-                    message.update(row)
-                    self.message_queue.put(message)
+                total_hit_rules += len(result_rows)
+                all_result_rows.extend(result_rows)
 
             self.message_queue.put({"type": "progress", "current": index, "total": total_files, "file_name": file_path.name})
+
+        for row in sort_result_rows(all_result_rows):
+            message = {"type": "row"}
+            message.update(row)
+            self.message_queue.put(message)
 
         self.message_queue.put({
             "type": "done",
@@ -1038,7 +1115,7 @@ class DLPScannerApp(ttk.Frame):
         headers = ["掃描時間", "風險等級", "處置", "檔案名稱", "命中類型", "命中次數", "命中範例", "完整路徑"]
         sheet.append(headers)
 
-        for row in self.export_rows:
+        for row in sort_export_rows(self.export_rows):
             sheet.append([
                 row.get("掃描時間", ""), row.get("風險等級", ""), row.get("處置", ""), row.get("檔案名稱", ""),
                 row.get("命中類型", ""), row.get("命中次數", ""), row.get("命中範例", ""), row.get("完整路徑", ""),
@@ -1058,6 +1135,7 @@ class DLPScannerApp(ttk.Frame):
             "高": PatternFill("solid", fgColor="FFC7CE"),
             "中": PatternFill("solid", fgColor="FFEB9C"),
             "低": PatternFill("solid", fgColor="C6EFCE"),
+            "提示": PatternFill("solid", fgColor="D9D9D9"),
             "未分類": PatternFill("solid", fgColor="D9EAD3"),
         }
 

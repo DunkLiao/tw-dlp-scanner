@@ -4,7 +4,14 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
-from dlp_scanner import DLPScannerApp, detect_or_rule_hits, scan_path, scan_path_with_or_hits
+from dlp_scanner import (
+    DLPScannerApp,
+    collect_text_detections,
+    detect_or_rule_hits,
+    scan_path,
+    scan_path_with_or_hits,
+    sort_result_rows,
+)
 
 
 def scan_text_content(content):
@@ -36,6 +43,34 @@ def find_row_prefix(rows, hit_type_prefix):
 
 
 class PolicyThresholdTests(unittest.TestCase):
+    def test_result_rows_sort_by_risk_high_medium_low_prompt(self):
+        rows = [
+            {"risk": "提示", "file_name": "prompt.txt"},
+            {"risk": "中", "file_name": "medium.txt"},
+            {"risk": "高", "file_name": "high.txt"},
+            {"risk": "低", "file_name": "low.txt"},
+        ]
+
+        sorted_rows = sort_result_rows(rows)
+
+        self.assertEqual(["高", "中", "低", "提示"], [row["risk"] for row in sorted_rows])
+        self.assertEqual(["prompt.txt", "medium.txt", "high.txt", "low.txt"], [row["file_name"] for row in rows])
+
+    def test_chinese_name_detection_keeps_clear_person_names(self):
+        detected = collect_text_detections("王小明先生\n陳美華小姐\n李大華君")
+
+        self.assertEqual(3, detected["4. 中文姓名"]["count"])
+        self.assertEqual(["王小明", "陳美華", "李大華"], detected["4. 中文姓名"]["samples"])
+
+    def test_chinese_name_detection_ignores_document_phrases(self):
+        detected = collect_text_detections(
+            "貸後監測作業規程：從被動審查轉向主動監控\n"
+            "企業集團關係判定手冊：從股權到經營者\n"
+            "一般流程主任說明"
+        )
+
+        self.assertNotIn("4. 中文姓名", detected)
+
     def test_or_rule_hits_report_any_raw_condition_below_policy_threshold(self):
         hits = detect_or_rule_hits("contact only_one@example.com")
 
@@ -95,6 +130,23 @@ class PolicyThresholdTests(unittest.TestCase):
             sheet = workbook["掃描結果"]
 
             self.assertEqual("123456789012", sheet.cell(row=2, column=7).value)
+
+    def test_excel_report_sorts_rows_by_risk(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_path = Path(temp_dir) / "report.xlsx"
+            fake_app = type("FakeApp", (), {})()
+            fake_app.export_rows = [
+                {"掃描時間": "2026-07-07 10:00:00", "風險等級": "提示", "處置": "額外OR提示", "檔案名稱": "d.txt"},
+                {"掃描時間": "2026-07-07 10:00:00", "風險等級": "低", "處置": "僅記錄", "檔案名稱": "c.txt"},
+                {"掃描時間": "2026-07-07 10:00:00", "風險等級": "高", "處置": "記錄並阻擋", "檔案名稱": "a.txt"},
+                {"掃描時間": "2026-07-07 10:00:00", "風險等級": "中", "處置": "僅記錄", "檔案名稱": "b.txt"},
+            ]
+
+            DLPScannerApp.write_excel_report(fake_app, report_path)
+            workbook = load_workbook(report_path)
+            sheet = workbook["掃描結果"]
+
+            self.assertEqual(["高", "中", "低", "提示"], [sheet.cell(row=index, column=2).value for index in range(2, 6)])
 
     def test_or_rule_hits_report_bank_account_condition(self):
         hits = detect_or_rule_hits("客戶往來明細查詢 123456789012")
