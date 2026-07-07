@@ -28,7 +28,6 @@ echo.
 echo [2/5] 安裝必要套件...
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-python -m pip install pyinstaller
 
 if errorlevel 1 (
     echo [錯誤] 套件安裝失敗。
@@ -40,7 +39,7 @@ echo.
 echo [3/5] 清除舊的 build / dist 資料夾...
 if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
-if exist dlp_scanner.spec del /q dlp_scanner.spec
+if exist DLPScanner.spec del /q DLPScanner.spec
 
 echo.
 echo [4/5] 開始打包 EXE...
@@ -76,14 +75,6 @@ echo EXE 位置：
 echo dist\DLPScanner.exe
 echo.
 
-if exist dist\DLPScanner.exe (
-    echo 是否開啟 dist 資料夾？
-    choice /c YN /m "請選擇"
-    if errorlevel 2 goto end
-    if errorlevel 1 explorer dist
-)
-
-:end
 echo.
 echo 完成。
 pause

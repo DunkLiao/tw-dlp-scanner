@@ -81,21 +81,21 @@ MAX_ZIP_SCAN_DEPTH = 5
 MAX_ZIP_ENTRY_BYTES = 50 * 1024 * 1024
 MAX_ZIP_TOTAL_BYTES = 500 * 1024 * 1024
 
-RISK_LEVELS = {
-    "1. 組合式個資": "高",
-    "2. 加密檔案": "中",
-    "3. 台灣地址": "中",
-    "4. 中文姓名": "低",
-    "5. 台灣身分證字號": "高",
-    "6. 護照號碼": "高",
-    "7. 信用卡號": "高",
-    "8. 銀行存摺根號與關鍵字": "高",
-    "9. 公文密等關鍵字組合": "高",
-    "10. 電子郵件": "低",
-    "11. 居留證號碼": "高",
-    "手機號碼": "中",
-    "電話號碼": "中",
-    "Taiwan ID 關鍵字": "中",
+ACTION_BY_RISK = {
+    "低": "僅記錄",
+    "中": "僅記錄",
+    "高": "記錄並阻擋",
+    "未知": "待確認",
+}
+
+POLICY_THRESHOLDS = {
+    "3. 台灣地址": {"低": 40, "中": 60, "高": 80},
+    "4. 中文姓名": {"低": 40, "中": 80, "高": 100},
+    "5. 台灣身分證字號": {"中": 1, "高": 2},
+    "6. 護照號碼": {"中": 1, "高": 2},
+    "7. 信用卡號": {"中": 1, "高": 2},
+    "10. 電子郵件": {"低": 40, "中": 60, "高": 80},
+    "11. 居留證號碼": {"中": 1, "高": 2},
 }
 
 TAIWAN_CITY_COUNTY = (
@@ -126,12 +126,10 @@ SINGLE_PATTERNS = {
 }
 
 CREDIT_CARD_PATTERN = re.compile(r"\b(?:\d[ -]*?){13,19}\b")
+BANK_ACCOUNT_PATTERN = re.compile(r"(?<!\d)\d{12,14}(?!\d)")
+BANK_KEYWORD_PATTERN = re.compile(r"客戶往來明細查詢")
 
 COMBO_RULES = [
-    {
-        "name": "8. 銀行存摺根號與關鍵字",
-        "all_of": [re.compile(r"客戶往來明細查詢"), re.compile(r"\b\d{10,14}\b")],
-    },
     {
         "name": "9. 公文密等關鍵字組合",
         "all_of": [
@@ -142,8 +140,12 @@ COMBO_RULES = [
     },
 ]
 
-COMBO_PI_TYPES = [
-    "4. 中文姓名", "手機號碼", "3. 台灣地址", "電話號碼", "5. 台灣身分證字號", "Taiwan ID 關鍵字"
+COMBO_PI_PAIRS = [
+    ("4. 中文姓名", "手機號碼"),
+    ("4. 中文姓名", "3. 台灣地址"),
+    ("4. 中文姓名", "電話號碼"),
+    ("4. 中文姓名", "Taiwan ID 關鍵字"),
+    ("3. 台灣地址", "Taiwan ID 關鍵字"),
 ]
 
 
@@ -200,6 +202,107 @@ def find_credit_cards(text):
         if luhn_check(raw):
             results.append(raw)
     return results
+
+
+def risk_from_thresholds(count, thresholds):
+    for risk in ("高", "中", "低"):
+        threshold = thresholds.get(risk)
+        if threshold is not None and count >= threshold:
+            return risk
+    return None
+
+
+def make_policy_hit(risk, count, samples):
+    return {
+        "risk": risk,
+        "action": ACTION_BY_RISK.get(risk, "待確認"),
+        "hit_count": count,
+        "samples": samples[:5],
+    }
+
+
+def collect_pattern_hits(pattern, text):
+    matches = [match.group(0) for match in pattern.finditer(text)]
+    return {
+        "count": len(matches),
+        "samples": matches[:5],
+    }
+
+
+def collect_text_detections(text):
+    detected = {}
+
+    for name, pattern in SINGLE_PATTERNS.items():
+        hit = collect_pattern_hits(pattern, text)
+        if hit["count"]:
+            detected[name] = hit
+
+    cards = find_credit_cards(text)
+    if cards:
+        detected["7. 信用卡號"] = {
+            "count": len(cards),
+            "samples": cards[:5],
+        }
+
+    return detected
+
+
+def has_combo_personal_data(detected):
+    for left, right in COMBO_PI_PAIRS:
+        left_hit = detected.get(left)
+        right_hit = detected.get(right)
+        if left_hit and right_hit and left_hit["count"] >= 2 and right_hit["count"] >= 2:
+            return True
+    return False
+
+
+def detect_or_rule_hits(text):
+    detected = collect_text_detections(text)
+    hit_names = []
+
+    if has_combo_personal_data(detected):
+        hit_names.append("1. 組合式個資")
+
+    for name in [
+        "3. 台灣地址",
+        "4. 中文姓名",
+        "5. 台灣身分證字號",
+        "6. 護照號碼",
+        "7. 信用卡號",
+    ]:
+        if name in detected:
+            hit_names.append(name)
+
+    if BANK_ACCOUNT_PATTERN.search(text):
+        hit_names.append("8. 銀行存款帳號與關鍵字")
+
+    for rule in COMBO_RULES:
+        if all(pattern.search(text) for pattern in rule["all_of"]):
+            hit_names.append(rule["name"])
+
+    for name in ["10. 電子郵件", "11. 居留證號碼"]:
+        if name in detected:
+            hit_names.append(name)
+
+    return hit_names
+
+
+def collect_or_hit_samples(text, hit_names):
+    detected = collect_text_detections(text)
+    samples_by_hit = {}
+
+    for hit_name in hit_names:
+        hit = detected.get(hit_name)
+        if hit:
+            samples_by_hit[hit_name] = hit["samples"]
+
+    bank_hit_names = [hit_name for hit_name in hit_names if hit_name.startswith("8. ")]
+    if bank_hit_names:
+        accounts = [match.group(0) for match in BANK_ACCOUNT_PATTERN.finditer(text)]
+        for hit_name in bank_hit_names:
+            samples_by_hit[hit_name] = accounts[:5]
+
+    return samples_by_hit
 
 
 def read_text_file(path):
@@ -430,25 +533,57 @@ def extract_text(path):
 
 
 def scan_text(text):
+    detected = collect_text_detections(text)
     hits = {}
 
-    for name, pattern in SINGLE_PATTERNS.items():
-        found = pattern.findall(text)
-        if found:
-            samples = [mask_sensitive(normalize_sample(item)) for item in found[:5]]
-            hits[name] = samples
+    for name, thresholds in POLICY_THRESHOLDS.items():
+        hit = detected.get(name)
+        if not hit:
+            continue
+        risk = risk_from_thresholds(hit["count"], thresholds)
+        if risk:
+            hits[name] = make_policy_hit(risk, hit["count"], hit["samples"])
 
-    cards = find_credit_cards(text)
-    if cards:
-        hits["7. 信用卡號"] = [mask_sensitive(card) for card in cards[:5]]
+    if BANK_KEYWORD_PATTERN.search(text):
+        accounts = [match.group(0) for match in BANK_ACCOUNT_PATTERN.finditer(text)]
+        if accounts:
+            hits["8. 銀行存款帳號與關鍵字"] = make_policy_hit(
+                "高",
+                len(accounts),
+                accounts[:5],
+            )
 
     for rule in COMBO_RULES:
         if all(pattern.search(text) for pattern in rule["all_of"]):
-            hits[rule["name"]] = ["關鍵字組合命中"]
+            hits[rule["name"]] = make_policy_hit("高", 1, ["關鍵字組合命中"])
 
-    matched_pi = [name for name in COMBO_PI_TYPES if name in hits]
-    if len(matched_pi) >= 2:
-        hits["1. 組合式個資"] = [" + ".join(matched_pi)]
+    combo_candidates = []
+    for left, right in COMBO_PI_PAIRS:
+        left_hit = detected.get(left)
+        right_hit = detected.get(right)
+        if not left_hit or not right_hit:
+            continue
+        if left_hit["count"] < 2 or right_hit["count"] < 2:
+            continue
+
+        max_count = max(left_hit["count"], right_hit["count"])
+        if max_count >= 5:
+            risk = "高"
+        elif max_count >= 3:
+            risk = "中"
+        else:
+            risk = "低"
+
+        combo_candidates.append({
+            "risk": risk,
+            "count": left_hit["count"] + right_hit["count"],
+            "sample": f"{left}({left_hit['count']}) + {right}({right_hit['count']})",
+        })
+
+    if combo_candidates:
+        combo_candidates.sort(key=lambda item: ("低", "中", "高").index(item["risk"]), reverse=True)
+        best = combo_candidates[0]
+        hits["1. 組合式個資"] = make_policy_hit(best["risk"], best["count"], [best["sample"]])
 
     return hits
 
@@ -458,7 +593,7 @@ def scan_file(path):
     try:
         ext = path.suffix.lower()
         if ext in ENCRYPT_TARGET_EXTS and is_encrypted_file(path):
-            hits[ENCRYPTED_FILE_RULE] = [f"{ext} 可能為加密檔案"]
+            hits[ENCRYPTED_FILE_RULE] = make_policy_hit("高", 1, [f"{ext} 可能為加密檔案"])
 
         if ext in SUPPORTED_SCAN_EXTS:
             text = extract_text(path)
@@ -469,11 +604,57 @@ def scan_file(path):
         return hits, str(err)
 
 
+def scan_file_with_or_hits(path):
+    hits = {}
+    or_hits = []
+    try:
+        ext = path.suffix.lower()
+        if ext in ENCRYPT_TARGET_EXTS and is_encrypted_file(path):
+            hits[ENCRYPTED_FILE_RULE] = make_policy_hit("高", 1, [f"{ext} 可能為加密檔案"])
+            or_hits.append(ENCRYPTED_FILE_RULE)
+
+        if ext in SUPPORTED_SCAN_EXTS:
+            text = extract_text(path)
+            if text:
+                hits.update(scan_text(text))
+                text_or_hits = detect_or_rule_hits(text)
+                or_hits.extend(text_or_hits)
+                or_hit_samples = collect_or_hit_samples(text, text_or_hits)
+            else:
+                or_hit_samples = {}
+        else:
+            or_hit_samples = {}
+        return hits, "", sorted(set(or_hits), key=or_hits.index), or_hit_samples
+    except Exception as err:
+        return hits, str(err), sorted(set(or_hits), key=or_hits.index), {}
+
+
 def build_result_rows(file_name, full_path, hits):
     rows = []
-    for hit_type, samples in hits.items():
+    for hit_type, hit in hits.items():
         rows.append({
-            "risk": RISK_LEVELS.get(hit_type, "未知"),
+            "risk": hit.get("risk", "未知"),
+            "action": hit.get("action", "待確認"),
+            "file_name": file_name,
+            "hit_type": hit_type,
+            "hit_count": hit.get("hit_count", 0),
+            "sample": " / ".join(hit.get("samples", [])[:5]),
+            "full_path": full_path,
+        })
+    return rows
+
+
+def build_or_hit_rows(file_name, full_path, or_hits, existing_hit_types=None, samples_by_hit=None):
+    existing_hit_types = set(existing_hit_types or [])
+    samples_by_hit = samples_by_hit or {}
+    rows = []
+    for hit_type in or_hits:
+        if hit_type in existing_hit_types:
+            continue
+        samples = samples_by_hit.get(hit_type) or ["OR運算命中"]
+        rows.append({
+            "risk": "提示",
+            "action": "額外OR提示",
             "file_name": file_name,
             "hit_type": hit_type,
             "hit_count": len(samples),
@@ -491,13 +672,16 @@ def safe_zip_member_name(name):
     return "/".join(parts)
 
 
-def scan_zip_archive(path, display_path=None, depth=0):
+def scan_zip_archive(path, display_path=None, depth=0, include_or_hits=False):
     archive_path = Path(path)
     archive_display_path = display_path or str(archive_path)
     rows = []
+    or_hits = []
     total_uncompressed = 0
 
     if depth >= MAX_ZIP_SCAN_DEPTH:
+        if include_or_hits:
+            return rows, or_hits
         return rows
 
     try:
@@ -511,8 +695,9 @@ def scan_zip_archive(path, display_path=None, depth=0):
                 inner_file_name = Path(inner_name).name
 
                 if info.flag_bits & 0x1:
-                    hits = {ENCRYPTED_FILE_RULE: ["zip entry encrypted"]}
+                    hits = {ENCRYPTED_FILE_RULE: make_policy_hit("高", 1, ["zip entry encrypted"])}
                     rows.extend(build_result_rows(inner_file_name, inner_display_path, hits))
+                    or_hits.append(ENCRYPTED_FILE_RULE)
                     continue
 
                 if info.file_size > MAX_ZIP_ENTRY_BYTES:
@@ -536,13 +721,34 @@ def scan_zip_archive(path, display_path=None, depth=0):
                     temp_path.write_bytes(data)
 
                     if ext == ".zip":
-                        rows.extend(scan_zip_archive(temp_path, inner_display_path, depth + 1))
+                        if include_or_hits:
+                            nested_rows, nested_or_hits = scan_zip_archive(temp_path, inner_display_path, depth + 1, True)
+                            rows.extend(nested_rows)
+                            or_hits.extend(nested_or_hits)
+                        else:
+                            rows.extend(scan_zip_archive(temp_path, inner_display_path, depth + 1))
                     else:
-                        hits, _error = scan_file(temp_path)
+                        if include_or_hits:
+                            hits, _error, file_or_hits, file_or_hit_samples = scan_file_with_or_hits(temp_path)
+                            or_hits.extend(file_or_hits)
+                        else:
+                            hits, _error = scan_file(temp_path)
                         rows.extend(build_result_rows(inner_file_name, inner_display_path, hits))
+                        if include_or_hits:
+                            rows.extend(build_or_hit_rows(
+                                inner_file_name,
+                                inner_display_path,
+                                file_or_hits,
+                                hits.keys(),
+                                file_or_hit_samples,
+                            ))
     except Exception:
+        if include_or_hits:
+            return rows, sorted(set(or_hits), key=or_hits.index)
         return rows
 
+    if include_or_hits:
+        return rows, sorted(set(or_hits), key=or_hits.index)
     return rows
 
 
@@ -553,6 +759,17 @@ def scan_path(path):
 
     hits, _error = scan_file(path)
     return build_result_rows(path.name, str(path), hits)
+
+
+def scan_path_with_or_hits(path):
+    path = Path(path)
+    if path.suffix.lower() == ".zip":
+        return scan_zip_archive(path, include_or_hits=True)
+
+    hits, _error, or_hits, or_hit_samples = scan_file_with_or_hits(path)
+    rows = build_result_rows(path.name, str(path), hits)
+    rows.extend(build_or_hit_rows(path.name, str(path), or_hits, hits.keys(), or_hit_samples))
+    return rows, or_hits
 
 
 def open_file_with_default_app(path):
@@ -619,16 +836,17 @@ class DLPScannerApp(ttk.Frame):
         result_frame = ttk.LabelFrame(self, text="掃描結果", padding=8)
         result_frame.pack(fill="both", expand=True)
 
-        columns = ("risk", "file_name", "hit_type", "hit_count", "sample", "full_path")
+        columns = ("risk", "action", "file_name", "hit_type", "hit_count", "sample", "full_path")
         headings = {
             "risk": "風險",
+            "action": "處置",
             "file_name": "檔案名稱",
             "hit_type": "命中類型",
             "hit_count": "次數",
             "sample": "命中範例",
             "full_path": "完整路徑",
         }
-        widths = {"risk": 70, "file_name": 220, "hit_type": 220, "hit_count": 60, "sample": 300, "full_path": 420}
+        widths = {"risk": 70, "action": 110, "file_name": 220, "hit_type": 220, "hit_count": 60, "sample": 300, "full_path": 420}
 
         self.tree = ttk.Treeview(result_frame, columns=columns, show="headings", height=20)
         for col in columns:
@@ -697,9 +915,13 @@ class DLPScannerApp(ttk.Frame):
 
         hit_file_set = set()
         total_hit_rules = 0
+        or_hit_names = []
 
         for index, file_path in enumerate(files, start=1):
-            result_rows = scan_path(file_path)
+            result_rows, file_or_hits = scan_path_with_or_hits(file_path)
+            for hit_name in file_or_hits:
+                if hit_name not in or_hit_names:
+                    or_hit_names.append(hit_name)
             if result_rows:
                 hit_file_set.update(row["full_path"] for row in result_rows)
                 for row in result_rows:
@@ -710,7 +932,13 @@ class DLPScannerApp(ttk.Frame):
 
             self.message_queue.put({"type": "progress", "current": index, "total": total_files, "file_name": file_path.name})
 
-        self.message_queue.put({"type": "done", "total": total_files, "hit_files": len(hit_file_set), "hit_rules": total_hit_rules})
+        self.message_queue.put({
+            "type": "done",
+            "total": total_files,
+            "hit_files": len(hit_file_set),
+            "hit_rules": total_hit_rules,
+            "or_hits": or_hit_names,
+        })
 
     def poll_queue(self):
         try:
@@ -728,13 +956,14 @@ class DLPScannerApp(ttk.Frame):
                 elif message_type == "row":
                     risk = message["risk"]
                     values = (
-                        message["risk"], message["file_name"], message["hit_type"],
+                        message["risk"], message["action"], message["file_name"], message["hit_type"],
                         message["hit_count"], message["sample"], message["full_path"],
                     )
                     self.tree.insert("", END, values=values, tags=(risk,))
                     self.export_rows.append({
                         "掃描時間": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "風險等級": message["risk"],
+                        "處置": message["action"],
                         "檔案名稱": message["file_name"],
                         "命中類型": message["hit_type"],
                         "命中次數": message["hit_count"],
@@ -748,10 +977,14 @@ class DLPScannerApp(ttk.Frame):
                     total = message["total"]
                     hit_files = message["hit_files"]
                     hit_rules = message["hit_rules"]
+                    or_hits = message.get("or_hits", [])
                     self.status_var.set(f"完成：共掃描 {total} 個檔案，命中 {hit_files} 個檔案 / {hit_rules} 項規則")
 
                     if self.export_rows:
                         self.export_button.config(state="normal")
+
+                    if or_hits:
+                        messagebox.showwarning("OR運算命中", f"[OR運算命中:{', '.join(or_hits)}]")
 
                     if hit_files > 0:
                         messagebox.showwarning(
@@ -760,7 +993,7 @@ class DLPScannerApp(ttk.Frame):
                             f"發現 {hit_files} 個檔案命中敏感資料規則。\n"
                             f"合計 {hit_rules} 項規則命中。\n\n請查看下方清單或匯出 Excel 報表。",
                         )
-                    else:
+                    elif not or_hits:
                         messagebox.showinfo("掃描完成", f"共掃描 {total} 個檔案，未發現命中。")
                     return
         except queue.Empty:
@@ -802,12 +1035,12 @@ class DLPScannerApp(ttk.Frame):
         sheet = workbook.active
         sheet.title = "掃描結果"
 
-        headers = ["掃描時間", "風險等級", "檔案名稱", "命中類型", "命中次數", "命中範例", "完整路徑"]
+        headers = ["掃描時間", "風險等級", "處置", "檔案名稱", "命中類型", "命中次數", "命中範例", "完整路徑"]
         sheet.append(headers)
 
         for row in self.export_rows:
             sheet.append([
-                row.get("掃描時間", ""), row.get("風險等級", ""), row.get("檔案名稱", ""),
+                row.get("掃描時間", ""), row.get("風險等級", ""), row.get("處置", ""), row.get("檔案名稱", ""),
                 row.get("命中類型", ""), row.get("命中次數", ""), row.get("命中範例", ""), row.get("完整路徑", ""),
             ])
 
@@ -836,7 +1069,7 @@ class DLPScannerApp(ttk.Frame):
             for col_index in range(1, sheet.max_column + 1):
                 sheet.cell(row=row_index, column=col_index).alignment = wrap
 
-        widths = {1: 20, 2: 10, 3: 28, 4: 30, 5: 10, 6: 55, 7: 80}
+        widths = {1: 20, 2: 10, 3: 14, 4: 28, 5: 30, 6: 10, 7: 55, 8: 80}
         for col_index, width in widths.items():
             sheet.column_dimensions[get_column_letter(col_index)].width = width
 

@@ -49,8 +49,9 @@ class ZipScanTests(unittest.TestCase):
     def test_scan_path_reports_hits_inside_zip(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             archive_path = Path(temp_dir) / "archive.zip"
+            email_content = "\n".join(f"user{index}@example.com" for index in range(40))
             with zipfile.ZipFile(archive_path, "w") as zf:
-                zf.writestr("folder/customer.txt", "contact alice@example.com")
+                zf.writestr("folder/customer.txt", email_content)
 
             rows = scan_path(archive_path)
 
@@ -61,8 +62,9 @@ class ZipScanTests(unittest.TestCase):
     def test_scan_path_recurses_into_nested_zip(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             inner_path = Path(temp_dir) / "inner.zip"
+            email_content = "\n".join(f"user{index}@example.com" for index in range(40))
             with zipfile.ZipFile(inner_path, "w") as zf:
-                zf.writestr("secret.txt", "contact bob@example.com")
+                zf.writestr("secret.txt", email_content)
 
             outer_path = Path(temp_dir) / "outer.zip"
             with zipfile.ZipFile(outer_path, "w") as zf:
